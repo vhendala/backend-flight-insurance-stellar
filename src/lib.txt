@@ -1,0 +1,687 @@
+#![no_std]
+
+use soroban_sdk::{
+    contract, contractimpl, contracttype, token, Address, Env, String, Vec,
+};
+
+// -----------------------------------------------------------------------------
+// Tipos de domínio
+// -----------------------------------------------------------------------------
+
+const BPS_DENOMINATOR: u32 = 10_000;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FlightStatusKind {
+    OnTime,
+    Delayed,
+    Cancelled,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FlightStatus {
+    pub kind: FlightStatusKind,
+    pub delay_minutes: u32,
+    pub updated_by: Address,
+    pub updated_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Policy {
+    pub id: u64,
+    pub customer: Address,
+    pub flight_id: String,
+    pub premium: i128,
+    pub coverage_amount: i128,
+    pub active: bool,
+    pub resolved: bool,
+    pub payout_bps_applied: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Counts {
+    pub total: u64,
+    pub active: u64,
+    pub resolved: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]  
+pub struct Config {
+    pub token: Address,           // Token address (PADRÃO Soroban)
+    pub vault: Address,           // Cofre de liquidez (detém os fundos)
+    pub min_delay_minutes: u32,   // Mínimo de minutos de atraso para acionar payout de Delay
+    pub delayed_payout_bps: u32,  // Ex.: 5000 = 50% do coverage em caso de atraso >= mínimo
+    pub cancelled_payout_bps: u32 // Ex.: 10000 = 100% do coverage em caso de cancelamento
+}
+
+// -----------------------------------------------------------------------------
+// Storage keys
+// -----------------------------------------------------------------------------
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DataKey {
+    Admin,
+    Oracles, // Vec<Address>
+    Policy(u64),
+    FlightIndex(String),   // Vec<u64> de policy IDs
+    FlightStatus(String),  // FlightStatus
+    CounterTotal,
+    CounterActive,
+    CounterResolved,
+    Config,                // Config
+}
+
+// -----------------------------------------------------------------------------
+// Erros
+// -----------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    NotAdmin,
+    NotAuthorized,
+    ConfigNotSet,
+    InvalidParams,
+    NoPoliciesForFlight,
+    InsufficientVaultBalance,
+    Overflow,
+    TokenNotConfigured,
+    VaultNotConfigured,
+    PayoutDisabledOrZero,
+}
+
+fn err(env: &Env, e: Error) -> ! {
+    env.panic_with_error(&e);
+}
+
+// -----------------------------------------------------------------------------
+// Helpers internos
+// -----------------------------------------------------------------------------
+
+fn get_admin(env: &Env) -> Address {
+    env.storage()
+        .instance()
+        .get::<DataKey, Address>(&DataKey::Admin)
+        .unwrap_or_else(|| err(env, Error::NotAuthorized))
+}
+
+fn is_admin(env: &Env, addr: &Address) -> bool {
+    if let Some(a) = env.storage().instance().get::<DataKey, Address>(&DataKey::Admin) {
+        a == *addr
+    } else {
+        false
+    }
+}
+
+fn assert_admin(env: &Env) {
+    let invoker = env.invoker();
+    if !is_admin(env, &invoker) {
+        err(env, Error::NotAdmin);
+    }
+}
+
+fn get_oracles(env: &Env) -> Vec<Address> {
+    env.storage()
+        .instance()
+        .get::<DataKey, Vec<Address>>(&DataKey::Oracles)
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn set_oracles(env: &Env, v: &Vec<Address>) {
+    env.storage().instance().set(&DataKey::Oracles, v);
+}
+
+fn is_oracle(env: &Env, addr: &Address) -> bool {
+    let oracles = get_oracles(env);
+    oracles.iter().any(|o| o == addr)
+}
+
+fn assert_admin_or_oracle(env: &Env) {
+    let invoker = env.invoker();
+    if !is_admin(env, &invoker) && !is_oracle(env, &invoker) {
+        err(env, Error::NotAuthorized);
+    }
+}
+
+fn get_config(env: &Env) -> Config {
+    env.storage()
+        .instance()
+        .get::<DataKey, Config>(&DataKey::Config)
+        .unwrap_or_else(|| err(env, Error::ConfigNotSet))
+}
+
+fn set_config(env: &Env, cfg: &Config) {
+    env.storage().instance().set(&DataKey::Config, cfg);
+}
+
+fn next_policy_id(env: &Env) -> u64 {
+    let mut total = env
+        .storage()
+        .instance()
+        .get::<DataKey, u64>(&DataKey::CounterTotal)
+        .unwrap_or(0);
+    total = total.checked_add(1).unwrap_or_else(|| err(env, Error::Overflow));
+    env.storage().instance().set(&DataKey::CounterTotal, &total);
+    total
+}
+
+fn inc_active(env: &Env, delta: i64) {
+    let mut v = env
+        .storage()
+        .instance()
+        .get::<DataKey, u64>(&DataKey::CounterActive)
+        .unwrap_or(0);
+    if delta >= 0 {
+        v = v.checked_add(delta as u64).unwrap_or_else(|| err(env, Error::Overflow));
+    } else {
+        let d = (-delta) as u64;
+        v = v.checked_sub(d).unwrap_or_else(|| err(env, Error::Overflow));
+    }
+    env.storage().instance().set(&DataKey::CounterActive, &v);
+}
+
+fn inc_resolved(env: &Env, delta: i64) {
+    let mut v = env
+        .storage()
+        .instance()
+        .get::<DataKey, u64>(&DataKey::CounterResolved)
+        .unwrap_or(0);
+    if delta >= 0 {
+        v = v.checked_add(delta as u64).unwrap_or_else(|| err(env, Error::Overflow));
+    } else {
+        let d = (-delta) as u64;
+        v = v.checked_sub(d).unwrap_or_else(|| err(env, Error::Overflow));
+    }
+    env.storage().instance().set(&DataKey::CounterResolved, &v);
+}
+
+fn get_counts(env: &Env) -> Counts {
+    let total = env
+        .storage()
+        .instance()
+        .get::<DataKey, u64>(&DataKey::CounterTotal)
+        .unwrap_or(0);
+    let active = env
+        .storage()
+        .instance()
+        .get::<DataKey, u64>(&DataKey::CounterActive)
+        .unwrap_or(0);
+    let resolved = env
+        .storage()
+        .instance()
+        .get::<DataKey, u64>(&DataKey::CounterResolved)
+        .unwrap_or(0);
+    Counts { total, active, resolved }
+}
+
+fn get_flight_policy_ids(env: &Env, flight_id: &String) -> Vec<u64> {
+    env.storage()
+        .instance()
+        .get::<DataKey, Vec<u64>>(&DataKey::FlightIndex(flight_id.clone()))
+        .unwrap_or_else(|| Vec::new(env))
+}
+
+fn set_flight_policy_ids(env: &Env, flight_id: &String, ids: &Vec<u64>) {
+    env.storage()
+        .instance()
+        .set(&DataKey::FlightIndex(flight_id.clone()), ids);
+}
+
+fn save_flight_status(env: &Env, flight_id: &String, st: &FlightStatus) {
+    env.storage()
+        .instance()
+        .set(&DataKey::FlightStatus(flight_id.clone()), st);
+}
+
+fn get_flight_status(env: &Env, flight_id: &String) -> Option<FlightStatus> {
+    env.storage()
+        .instance()
+        .get::<DataKey, FlightStatus>(&DataKey::FlightStatus(flight_id.clone()))
+}
+
+// -----------------------------------------------------------------------------
+// Contrato
+// -----------------------------------------------------------------------------
+
+#[contract]
+pub struct FlightInsurance;
+
+#[contractimpl]
+impl FlightInsurance {
+    // -------------------------------------------------------------------------
+    // Inicialização e Configuração
+    // -------------------------------------------------------------------------
+
+    pub fn init(
+        env: Env,
+        admin: Address,
+        token: Address,
+        vault: Address,
+        min_delay_minutes: u32,
+        delayed_payout_bps: u32,
+        cancelled_payout_bps: u32,
+    ) {
+        // Inicializa admin
+        env.storage().instance().set(&DataKey::Admin, &admin);
+
+        // Inicializa oráculos (vazio)
+        let oracles: Vec<Address> = Vec::new(&env);
+        env.storage().instance().set(&DataKey::Oracles, &oracles);
+
+        // Inicializa contadores
+        env.storage().instance().set(&DataKey::CounterTotal, &0u64);
+        env.storage().instance().set(&DataKey::CounterActive, &0u64);
+        env.storage().instance().set(&DataKey::CounterResolved, &0u64);
+
+        // Configuração inicial
+        let cfg = Config {
+            token,
+            vault,
+            min_delay_minutes,
+            delayed_payout_bps,
+            cancelled_payout_bps,
+        };
+        set_config(&env, &cfg);
+    }
+
+    pub fn set_config(
+        env: Env,
+        min_delay_minutes: u32,
+        delayed_payout_bps: u32,
+        cancelled_payout_bps: u32,
+    ) {
+        assert_admin(&env);
+        let mut cfg = get_config(&env);
+        cfg.min_delay_minutes = min_delay_minutes;
+        cfg.delayed_payout_bps = delayed_payout_bps;
+        cfg.cancelled_payout_bps = cancelled_payout_bps;
+        set_config(&env, &cfg);
+    }
+
+    pub fn set_vault(env: Env, new_vault: Address) {
+        assert_admin(&env);
+        let mut cfg = get_config(&env);
+        cfg.vault = new_vault;
+        set_config(&env, &cfg);
+    }
+
+    pub fn set_token(env: Env, new_token: Address) {
+        assert_admin(&env);
+        let mut cfg = get_config(&env);
+        cfg.token = new_token;
+        set_config(&env, &cfg);
+    }
+
+    pub fn add_oracle(env: Env, oracle: Address) {
+        assert_admin(&env);
+        let mut v = get_oracles(&env);
+        if !v.iter().any(|o| o == oracle) {
+            v.push_back(oracle);
+            set_oracles(&env, &v);
+        }
+    }
+
+    pub fn remove_oracle(env: Env, oracle: Address) {
+        assert_admin(&env);
+        let mut v = get_oracles(&env);
+        let mut out = Vec::new(&env);
+        for addr in v.iter() {
+            if addr != oracle {
+                out.push_back(addr);
+            }
+        }
+        set_oracles(&env, &out);
+    }
+
+    // -------------------------------------------------------------------------
+    // Pool de Liquidez (Token Padrão Soroban)
+    // - Vault detém os fundos
+    // - Depositar: transfer(from -> vault)
+    // - Saque: transfer_from(spender=contrato, from=vault -> to)
+    // - Payout usa transfer_from do vault ao segurado (requer approve prévio)
+    // -------------------------------------------------------------------------
+
+    pub fn deposit_to_pool(env: Env, from: Address, amount: i128) {
+        // Quem chama deve ser o próprio "from"
+        from.require_auth();
+
+        let cfg = get_config(&env);
+        // Transferência do token: from -> vault
+        let token = token::Client::new(&env, &cfg.token);
+        token.transfer(&from, &cfg.vault, &amount);
+    }
+
+    pub fn withdraw_from_pool(env: Env, to: Address, amount: i128) {
+        // Apenas admin pode iniciar saque do vault (via allowance do vault)
+        assert_admin(&env);
+        let cfg = get_config(&env);
+
+        // Necessário: vault ter aprovado o contrato como spender
+        let token = token::Client::new(&env, &cfg.token);
+        let spender = env.current_contract_address();
+        token.transfer_from(&spender, &cfg.vault, &to, &amount);
+    }
+
+    pub fn vault_approve_allowance(env: Env, amount: i128, expiration_ledger: u32) {
+        // O próprio vault deve autorizar esta chamada para criar/atualizar allowance
+        let cfg = get_config(&env);
+        cfg.vault.require_auth();
+
+        let token = token::Client::new(&env, &cfg.token);
+        let spender = env.current_contract_address();
+        token.approve(&cfg.vault, &spender, &amount, &expiration_ledger);
+    }
+
+    pub fn get_liquidity_pool(env: Env) -> (Address, Address, i128) {
+        // Retorna (token, vault, balance_atual_do_vault)
+        let cfg = get_config(&env);
+        let token = token::Client::new(&env, &cfg.token);
+        let bal = token.balance(&cfg.vault);
+        (cfg.token, cfg.vault, bal)
+    }
+
+    // -------------------------------------------------------------------------
+    // Apólices
+    // -------------------------------------------------------------------------
+
+    pub fn create_policy(
+        env: Env,
+        customer: Address,
+        flight_id: String,
+        premium: i128,
+        coverage_amount: i128,
+    ) -> Policy {
+        // O customer deve autorizar a criação (e o pagamento do prêmio)
+        customer.require_auth();
+
+        let cfg = get_config(&env);
+
+        // Cobrar prêmio: customer -> vault
+        let token = token::Client::new(&env, &cfg.token);
+        token.transfer(&customer, &cfg.vault, &premium);
+
+        // Criar apólice
+        let id = next_policy_id(&env);
+        let policy = Policy {
+            id,
+            customer: customer.clone(),
+            flight_id: flight_id.clone(),
+            premium,
+            coverage_amount,
+            active: true,
+            resolved: false,
+            payout_bps_applied: 0,
+        };
+
+        // Persistir apólice
+        env.storage()
+            .instance()
+            .set(&DataKey::Policy(id), &policy);
+
+        // Atualizar índice por voo
+        let mut ids = get_flight_policy_ids(&env, &flight_id);
+        ids.push_back(id);
+        set_flight_policy_ids(&env, &flight_id, &ids);
+
+        // Atualizar contadores
+        inc_active(&env, 1);
+
+        policy
+    }
+
+    pub fn get_policy(env: Env, id: u64) -> Option<Policy> {
+        env.storage().instance().get::<DataKey, Policy>(&DataKey::Policy(id))
+    }
+
+    pub fn get_policies_by_flight(env: Env, flight_id: String) -> Vec<Policy> {
+        let ids = get_flight_policy_ids(&env, &flight_id);
+        let mut out = Vec::new(&env);
+        for pid in ids.iter() {
+            if let Some(p) = env.storage().instance().get::<DataKey, Policy>(&DataKey::Policy(pid)) {
+                out.push_back(p);
+            }
+        }
+        out
+    }
+
+    // Lista apólices ativas (paginado por id)
+    // cursor: id inicial (exclusivo). Use 0 para iniciar.
+    // limit: máximo de itens a retornar.
+    pub fn get_active_policies(env: Env, cursor: u64, limit: u32) -> Vec<Policy> {
+        let counts = get_counts(&env);
+        let total = counts.total;
+        let mut out = Vec::new(&env);
+
+        if total == 0 || limit == 0 {
+            return out;
+        }
+
+        let mut id = cursor;
+        let mut fetched: u32 = 0;
+
+        // varre por id crescente até atingir o limit
+        loop {
+            id = id.saturating_add(1);
+            if id > total {
+                break;
+            }
+            if let Some(p) = env.storage().instance().get::<DataKey, Policy>(&DataKey::Policy(id)) {
+                if p.active && !p.resolved {
+                    out.push_back(p);
+                    fetched += 1;
+                    if fetched >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    // -------------------------------------------------------------------------
+    // Status de voo + Resolução
+    // -------------------------------------------------------------------------
+
+    // Consulta status atual do voo (se houver)
+    pub fn get_flight_status(env: Env, flight_id: String) -> Option<FlightStatus> {
+        get_flight_status(&env, &flight_id)
+    }
+
+    // Esta função RECEBE o status do voo e RESOLVE apólices por flight_id.
+    // - kind/delay_minutes determinam o payout_bps conforme config
+    // - Se do_payout = true, transfere os pagamentos (requer allowance do vault)
+    // - Tudo atômico: se saldo insuficiente do vault quando payout for devido, reverte
+    pub fn submit_and_resolve_by_flight(
+        env: Env,
+        flight_id: String,
+        kind: FlightStatusKind,
+        delay_minutes: u32,
+        do_payout: bool,
+    ) -> (u32, i128) {
+        // Somente admin ou oráculo autorizado
+        assert_admin_or_oracle(&env);
+
+        // Salva/atualiza status do voo on-chain
+        let inv = env.invoker();
+        let now = env.ledger().timestamp();
+        let st = FlightStatus {
+            kind: kind.clone(),
+            delay_minutes,
+            updated_by: inv,
+            updated_at: now,
+        };
+        save_flight_status(&env, &flight_id, &st);
+
+        // Resolve com base no status recebido
+        Self::resolve_policies_by_flight_internal(env, flight_id, kind, delay_minutes, do_payout)
+    }
+
+    // Resolve lendo o status que já foi salvo via submit_and_resolve_by_flight (ou outra chamada).
+    // Útil caso queira separar submissão de status e execução da resolução.
+    pub fn resolve_policies_by_flight(env: Env, flight_id: String, do_payout: bool) -> (u32, i128) {
+        assert_admin_or_oracle(&env);
+
+        let st = get_flight_status(&env, &flight_id)
+            .unwrap_or_else(|| err(&env, Error::InvalidParams));
+
+        Self::resolve_policies_by_flight_internal(env, flight_id, st.kind, st.delay_minutes, do_payout)
+    }
+
+    fn resolve_policies_by_flight_internal(
+        env: Env,
+        flight_id: String,
+        kind: FlightStatusKind,
+        delay_minutes: u32,
+        do_payout: bool,
+    ) -> (u32, i128) {
+        let cfg = get_config(&env);
+
+        // Determinar payout_bps aplicável
+        let payout_bps = match kind {
+            FlightStatusKind::Cancelled => cfg.cancelled_payout_bps,
+            FlightStatusKind::Delayed => {
+                if delay_minutes >= cfg.min_delay_minutes {
+                    cfg.delayed_payout_bps
+                } else {
+                    0
+                }
+            }
+            FlightStatusKind::OnTime => 0,
+        };
+
+        // Carrega ids das apólices do voo
+        let ids = get_flight_policy_ids(&env, &flight_id);
+        if ids.len() == 0 {
+            err(&env, Error::NoPoliciesForFlight);
+        }
+
+        // Coleta as apólices que estão ativas e não resolvidas
+        let mut target_ids: Vec<u64> = Vec::new(&env);
+        let mut total_payout: i128 = 0;
+
+        for pid in ids.iter() {
+            if let Some(mut p) = env.storage().instance().get::<DataKey, Policy>(&DataKey::Policy(pid)) {
+                if p.active && !p.resolved {
+                    target_ids.push_back(pid);
+
+                    // Se payout aplicável, soma o valor a ser pago
+                    if payout_bps > 0 {
+                        let part = (p.coverage_amount as i128)
+                            .checked_mul(payout_bps as i128)
+                            .unwrap_or_else(|| err(&env, Error::Overflow))
+                            / (BPS_DENOMINATOR as i128);
+                        total_payout = total_payout
+                            .checked_add(part)
+                            .unwrap_or_else(|| err(&env, Error::Overflow));
+                    }
+                }
+            }
+        }
+
+        let n = target_ids.len() as u32;
+
+        // Se não há apólice ativa a resolver, retorna
+        if n == 0 {
+            return (0, 0);
+        }
+
+        // Se haverá payout, verificar saldo do vault antes (atomicidade)
+        if do_payout && payout_bps > 0 {
+            let token = token::Client::new(&env, &cfg.token);
+            let bal = token.balance(&cfg.vault);
+            if bal < total_payout {
+                err(&env, Error::InsufficientVaultBalance);
+            }
+        }
+
+        // Atualiza as apólices (aplica a resolução)
+        for pid in target_ids.iter() {
+            if let Some(mut p) = env.storage().instance().get::<DataKey, Policy>(&DataKey::Policy(pid)) {
+                if p.active && !p.resolved {
+                    p.active = false;
+                    p.resolved = true;
+                    p.payout_bps_applied = payout_bps;
+                    env.storage().instance().set(&DataKey::Policy(pid), &p);
+                }
+            }
+        }
+
+        // Atualiza contadores
+        inc_active(&env, -(n as i64));
+        inc_resolved(&env, n as i64);
+
+        // Efetua payout se aplicável
+        if do_payout && payout_bps > 0 && total_payout > 0 {
+            let token = token::Client::new(&env, &cfg.token);
+            let spender = env.current_contract_address();
+
+            // Transferências individuais (from = vault -> to = customer)
+            for pid in target_ids.iter() {
+                if let Some(p) = env.storage().instance().get::<DataKey, Policy>(&DataKey::Policy(pid)) {
+                    // Valor da apólice
+                    let amount = (p.coverage_amount as i128)
+                        .checked_mul(payout_bps as i128)
+                        .unwrap_or_else(|| err(&env, Error::Overflow))
+                        / (BPS_DENOMINATOR as i128);
+
+                    if amount > 0 {
+                        token.transfer_from(&spender, &cfg.vault, &p.customer, &amount);
+                    }
+                }
+            }
+        }
+
+        // Retorna (quantidade resolvida, total_payout agregado)
+        (n, if payout_bps > 0 { total_payout } else { 0 })
+    }
+
+    // -------------------------------------------------------------------------
+    // Contagens
+    // -------------------------------------------------------------------------
+
+    pub fn get_counts(env: Env) -> Counts {
+        get_counts(&env)
+    }
+
+    pub fn get_total_policies(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::CounterTotal)
+            .unwrap_or(0)
+    }
+
+    pub fn get_active_policies_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::CounterActive)
+            .unwrap_or(0)
+    }
+
+    pub fn get_resolved_policies_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get::<DataKey, u64>(&DataKey::CounterResolved)
+            .unwrap_or(0)
+    }
+
+    // -------------------------------------------------------------------------
+    // Admin e Autorização
+    // -------------------------------------------------------------------------
+
+    pub fn get_admin(env: Env) -> Address {
+        get_admin(&env)
+    }
+
+    pub fn set_admin(env: Env, new_admin: Address) {
+        assert_admin(&env);
+        env.storage().instance().set(&DataKey::Admin, &new_admin);
+    }
+
+    pub fn is_admin(env: Env, address: Address) -> bool {
+        is_admin(&env, &address)
+    }
+}
