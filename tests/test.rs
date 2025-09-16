@@ -1,369 +1,297 @@
-// test.rs
-
 #![cfg(test)]
 
-use flight_delay_insurance_contract::{FlightInsuranceContract, FlightInsuranceContractClient};
+use super::*;
+use soroban_sdk::testutils::{Address as _, Ledger};
+use soroban_sdk::{symbol_short, token, Address, Env};
 
-use soroban_sdk::{
-    testutils::{Address as _, Ledger, LedgerInfo},
-    token, Address, Env, IntoVal, String, // Correção: IntoVal importado
-};
+// Helper para criar e configurar o contrato em um ambiente de teste
+fn setup_contract<'a>() -> (
+    Env,
+    FlightInsuranceContractClient<'a>,
+    Address,
+    Address,
+    token::Client<'a>,
+) {
+    let env = Env::default();
+    env.ledger().set(LedgerInfo {
+        timestamp: 1726500000, // 16 de Setembro de 2025
+        protocol_version: 20,
+        sequence_number: 10,
+        network_id: Default::default(),
+        base_reserve: 10,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+    });
 
-fn create_token_contract(env: &Env, admin: &Address) -> Address {
-    env.register_stellar_asset_contract_v2(admin.clone()).address()
-}
+    let contract_id = env.register_contract(None, FlightInsuranceContract);
+    let client = FlightInsuranceContractClient::new(&env, &contract_id);
 
-fn create_insurance_contract<'a>(env: &Env) -> FlightInsuranceContractClient<'a> {
-    let contract_id = env.register(FlightInsuranceContract, ());
-    FlightInsuranceContractClient::new(env, &contract_id)
+    let admin = Address::random(&env);
+    let usdc_token_id = env.register_stellar_asset_contract(admin.clone());
+    let usdc_token = token::Client::new(&env, &usdc_token_id);
+
+    // O pool inicial é transferido externamente, então apenas inicializamos o valor
+    let initial_capital = 10_000 * 1_0000000; // 10,000 USDC
+    usdc_token.mint(&contract_id, &initial_capital);
+
+    client.initialize(&admin, &usdc_token_id, &initial_capital);
+
+    (env, client, admin, usdc_token_id, usdc_token)
 }
 
 #[test]
-fn test_contract_initialization() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let token_addr = create_token_contract(&env, &admin);
-    let contract = create_insurance_contract(&env);
-    let initial_capital = 10_000_0000000i128;
-    contract.initialize(&admin, &token_addr, &initial_capital);
-    assert_eq!(contract.get_liquidity_pool(), initial_capital);
-    assert!(contract.is_admin(&admin));
-    assert_eq!(contract.get_total_policies(), 0);
-}
+fn test_initialize() {
+    let (env, client, admin, usdc_token_id, _) = setup_contract();
 
-#[test]
-fn test_create_policy_success() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let customer = Address::generate(&env);
-    let token_addr = create_token_contract(&env, &admin);
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
-    let token_client = token::Client::new(&env, &token_addr);
-    let contract = create_insurance_contract(&env);
-    let initial_capital = 10_000_0000000i128;
-    contract.initialize(&admin, &token_addr, &initial_capital);
-    let premium_amount = 841_0000i128;
-    token_admin_client.mint(&customer, &premium_amount);
-    let flight_id = String::from_str(&env, "G32102");
-    let flight_date = env.ledger().timestamp() + (24 * 60 * 60);
-    let coverage_amount = 50_0000000i128;
-    let policy_id = contract.create_policy(
-        &customer,
-        &flight_id,
-        &flight_date,
-        &premium_amount,
-        &coverage_amount,
+    // Verifica se os valores foram salvos corretamente
+    assert_eq!(client.is_admin(&admin), true);
+    assert_eq!(
+        client.get_liquidity_pool(),
+        10_000 * 1_0000000
     );
-    assert_eq!(policy_id, 1);
-    let policy = contract.get_policy(&policy_id);
-    assert_eq!(policy.customer, customer);
-    assert_eq!(policy.flight_id, flight_id);
-    assert_eq!(policy.premium_amount, premium_amount);
-    assert_eq!(policy.coverage_amount, coverage_amount);
-    assert!(!policy.resolved);
-    assert!(!policy.paid_out);
-    let expected_pool = initial_capital + premium_amount;
-    assert_eq!(contract.get_liquidity_pool(), expected_pool);
-    assert_eq!(token_client.balance(&customer), 0);
-    assert_eq!(token_client.balance(&contract.address), premium_amount);
-    let active = contract.get_active_policies();
-    assert_eq!(active.len(), 1);
-    assert_eq!(active.get(0).unwrap(), policy_id);
+
+    // Verifica se chamar initialize de novo causa pânico
+    let result = env.try_invoke_contract_fn(
+        &client.address,
+        symbol_short!("initialize"),
+        (admin, usdc_token_id, 1000i128).into_val(&env),
+    );
+    assert!(result.is_err());
 }
+
+#[test]
+fn test_create_policy() {
+    let (env, client, _, usdc_token_id, usdc_token) = setup_contract();
+
+    let customer = Address::random(&env);
+    let premium = 50 * 1_0000000; // 50 USDC
+    let coverage = 500 * 1_0000000; // 500 USDC
+    let flight_date = env.ledger().timestamp() + (48 * 60 * 60); // 48 horas no futuro
+
+    // Dando fundos ao cliente
+    usdc_token.mint(&customer, &(premium + 10_0000000));
+
+    // Cliente (customer) precisa autorizar a chamada
+    env.as_contract(&client.address, || {
+        let policy_id = client
+            .with_source_account(&customer)
+            .create_policy(
+                &customer,
+                &"FL123".into_val(&env),
+                &flight_date,
+                &premium,
+                &coverage,
+            );
+
+        assert_eq!(policy_id, 1);
+
+        // Verifica a apólice
+        let policy = client.get_policy(&policy_id);
+        assert_eq!(policy.customer, customer);
+        assert_eq!(policy.premium_amount, premium);
+        assert_eq!(policy.status, PolicyStatus::Unresolved);
+
+        // Verifica se o prêmio foi transferido
+        assert_eq!(usdc_token.balance(&customer), 10_0000000);
+        assert_eq!(
+            usdc_token.balance(&client.address),
+            10_000 * 1_0000000 + premium
+        );
+
+        // Verifica se o pool de liquidez foi atualizado
+        assert_eq!(
+            client.get_liquidity_pool(),
+            10_000 * 1_0000000 + premium
+        );
+        
+        // Verifica se a apólice está na lista de ativas e no mapeamento de voos
+        assert_eq!(client.get_active_policies().len(), 1);
+        assert_eq!(client.get_policies_for_flight(&"FL123".into_val(&env)).len(), 1);
+    });
+}
+
 
 #[test]
 #[should_panic(expected = "Insufficient liquidity pool")]
-fn test_create_policy_insufficient_pool() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let customer = Address::generate(&env);
-    let token_addr = create_token_contract(&env, &admin);
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
-    let contract = create_insurance_contract(&env);
-    let initial_capital = 10_0000000i128;
-    contract.initialize(&admin, &token_addr, &initial_capital);
-    let premium_amount = 8_0000000i128;
-    let coverage_amount = 50_0000000i128;
-    token_admin_client.mint(&customer, &premium_amount);
-    let flight_id = String::from_str(&env, "G32102");
-    let flight_date = env.ledger().timestamp() + (24 * 60 * 60);
-    contract.create_policy(&customer, &flight_id, &flight_date, &premium_amount, &coverage_amount);
+fn test_create_policy_insufficient_liquidity() {
+    let (env, client, _, _, _) = setup_contract();
+    let customer = Address::random(&env);
+    
+    // Cobertura maior que o pool inicial
+    let coverage = 20_000 * 1_0000000; 
+
+    client.with_source_account(&customer).create_policy(
+        &customer,
+        &"FL999".into_val(&env),
+        &(env.ledger().timestamp() + 1000),
+        &(100 * 1_0000000),
+        &coverage,
+    );
 }
 
 #[test]
-fn test_resolve_policy_no_delay() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let customer = Address::generate(&env);
-    let token_addr = create_token_contract(&env, &admin);
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
-    let token_client = token::Client::new(&env, &token_addr);
-    let contract = create_insurance_contract(&env);
-    let initial_capital = 10_000_0000000i128;
-    contract.initialize(&admin, &token_addr, &initial_capital);
-    let premium_amount = 841_0000i128;
-    let coverage_amount = 50_0000000i128;
-    token_admin_client.mint(&customer, &premium_amount);
-    let flight_id = String::from_str(&env, "G32102");
-    let flight_date = env.ledger().timestamp() + (24 * 60 * 60);
-    let policy_id = contract.create_policy(
-        &customer, &flight_id, &flight_date, &premium_amount, &coverage_amount
+fn test_resolve_flight_on_time() {
+    let (env, client, admin, _, usdc_token) = setup_contract();
+    let customer = Address::random(&env);
+    let premium = 50 * 1_0000000;
+    usdc_token.mint(&customer, &premium);
+
+    let policy_id = client.with_source_account(&customer).create_policy(
+        &customer, &"FL456".into_val(&env), &(env.ledger().timestamp() + 1000), &premium, &(500 * 1_0000000)
     );
-    env.ledger().with_mut(|li| {
-        li.timestamp = flight_date + 3600;
-    });
-    let pool_before = contract.get_liquidity_pool();
-    let customer_balance_before = token_client.balance(&customer);
-    contract.resolve_policy(&policy_id, &false);
-    let policy = contract.get_policy(&policy_id);
-    assert!(policy.resolved);
-    assert!(!policy.paid_out);
-    assert_eq!(contract.get_liquidity_pool(), pool_before);
-    assert_eq!(token_client.balance(&customer), customer_balance_before);
-    let active = contract.get_active_policies();
-    assert_eq!(active.len(), 0);
+
+    let initial_pool = client.get_liquidity_pool();
+    
+    client.with_source_account(&admin).resolve_flight(&"FL456".into_val(&env), &FlightResolution::OnTime);
+
+    let policy = client.get_policy(&policy_id);
+    assert_eq!(policy.status, PolicyStatus::OnTime);
+    assert_eq!(policy.payout_amount, 0);
+
+    // Pool não mudou (lucrou o prêmio)
+    assert_eq!(client.get_liquidity_pool(), initial_pool);
+    // Cliente não recebeu nada de volta
+    assert_eq!(usdc_token.balance(&customer), 0);
+    // Apólice não está mais ativa
+    assert_eq!(client.get_active_policies().len(), 0);
+    assert_eq!(client.get_policies_for_flight(&"FL456".into_val(&env)).len(), 0);
 }
 
 #[test]
-fn test_resolve_policy_with_delay() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let customer = Address::generate(&env);
-    let token_addr = create_token_contract(&env, &admin);
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
-    let token_client = token::Client::new(&env, &token_addr);
-    let contract = create_insurance_contract(&env);
-    let initial_capital = 10_000_0000000i128;
-    contract.initialize(&admin, &token_addr, &initial_capital);
-    let premium_amount = 841_0000i128;
-    let coverage_amount = 50_0000000i128;
-    token_admin_client.mint(&customer, &premium_amount);
-    token_admin_client.mint(&contract.address, &(initial_capital + premium_amount));
-    let flight_id = String::from_str(&env, "G32102");
-    let flight_date = env.ledger().timestamp() + (24 * 60 * 60);
-    let policy_id = contract.create_policy(
-        &customer, &flight_id, &flight_date, &premium_amount, &coverage_amount
+fn test_resolve_flight_cancelled() {
+    let (env, client, admin, _, usdc_token) = setup_contract();
+    let customer = Address::random(&env);
+    let premium = 50 * 1_0000000;
+    usdc_token.mint(&customer, &premium);
+
+    let policy_id = client.with_source_account(&customer).create_policy(
+        &customer, &"FL789".into_val(&env), &(env.ledger().timestamp() + 1000), &premium, &(500 * 1_0000000)
     );
-    env.ledger().with_mut(|li| {
-        li.timestamp = flight_date + 3600;
-    });
-    let pool_before = contract.get_liquidity_pool();
-    let customer_balance_before = token_client.balance(&customer);
-    contract.resolve_policy(&policy_id, &true);
-    let policy = contract.get_policy(&policy_id);
-    assert!(policy.resolved);
-    assert!(policy.paid_out);
-    let expected_pool = pool_before - coverage_amount;
-    assert_eq!(contract.get_liquidity_pool(), expected_pool);
-    let expected_balance = customer_balance_before + coverage_amount;
-    assert_eq!(token_client.balance(&customer), expected_balance);
+
+    let initial_pool_before_premium = 10_000 * 1_0000000;
+    
+    client.with_source_account(&admin).resolve_flight(&"FL789".into_val(&env), &FlightResolution::Cancelled);
+
+    let policy = client.get_policy(&policy_id);
+    assert_eq!(policy.status, PolicyStatus::Cancelled);
+    assert_eq!(policy.payout_amount, premium);
+
+    // Pool voltou ao estado original (prêmio foi devolvido)
+    assert_eq!(client.get_liquidity_pool(), initial_pool_before_premium);
+    // Cliente recebeu o prêmio de volta
+    assert_eq!(usdc_token.balance(&customer), premium);
+    assert_eq!(client.get_active_policies().len(), 0);
 }
+
+#[test]
+fn test_resolve_flight_delayed_partial_payout() {
+    let (env, client, admin, _, usdc_token) = setup_contract();
+    let customer = Address::random(&env);
+    let premium = 50 * 1_0000000;
+    let coverage = 500 * 1_0000000;
+    let expected_payout = coverage / 2; // 50%
+    usdc_token.mint(&customer, &premium);
+
+    let policy_id = client.with_source_account(&customer).create_policy(
+        &customer, &"FL-D1".into_val(&env), &(env.ledger().timestamp() + 1000), &premium, &coverage
+    );
+
+    let pool_after_premium = client.get_liquidity_pool();
+    
+    // Atraso de 90 minutos
+    client.with_source_account(&admin).resolve_flight(&"FL-D1".into_val(&env), &FlightResolution::Delayed(90));
+
+    let policy = client.get_policy(&policy_id);
+    assert_eq!(policy.status, PolicyStatus::Delayed);
+    assert_eq!(policy.payout_amount, expected_payout);
+
+    // Pool foi reduzido pelo pagamento
+    assert_eq!(client.get_liquidity_pool(), pool_after_premium - expected_payout);
+    // Cliente recebeu o pagamento
+    assert_eq!(usdc_token.balance(&customer), expected_payout);
+}
+
+#[test]
+fn test_resolve_flight_delayed_full_payout() {
+    let (env, client, admin, _, usdc_token) = setup_contract();
+    let customer = Address::random(&env);
+    let premium = 50 * 1_0000000;
+    let coverage = 500 * 1_0000000;
+    usdc_token.mint(&customer, &premium);
+
+    let policy_id = client.with_source_account(&customer).create_policy(
+        &customer, &"FL-D2".into_val(&env), &(env.ledger().timestamp() + 1000), &premium, &coverage
+    );
+
+    let pool_after_premium = client.get_liquidity_pool();
+    
+    // Atraso de 200 minutos
+    client.with_source_account(&admin).resolve_flight(&"FL-D2".into_val(&env), &FlightResolution::Delayed(200));
+
+    let policy = client.get_policy(&policy_id);
+    assert_eq!(policy.status, PolicyStatus::Delayed);
+    assert_eq!(policy.payout_amount, coverage);
+
+    assert_eq!(client.get_liquidity_pool(), pool_after_premium - coverage);
+    assert_eq!(usdc_token.balance(&customer), coverage);
+}
+
+#[test]
+fn test_resolve_multiple_policies_for_same_flight() {
+    let (env, client, admin, _, usdc_token) = setup_contract();
+    
+    let customer1 = Address::random(&env);
+    let customer2 = Address::random(&env);
+    let premium = 20 * 1_0000000;
+    let coverage = 200 * 1_0000000;
+    let flight_id = "FL-MULTI".into_val(&env);
+
+    usdc_token.mint(&customer1, &premium);
+    usdc_token.mint(&customer2, &premium);
+
+    let policy1_id = client.with_source_account(&customer1).create_policy(
+        &customer1, &flight_id, &(env.ledger().timestamp() + 1000), &premium, &coverage
+    );
+    let policy2_id = client.with_source_account(&customer2).create_policy(
+        &customer2, &flight_id, &(env.ledger().timestamp() + 1000), &premium, &coverage
+    );
+
+    assert_eq!(client.get_active_policies().len(), 2);
+    assert_eq!(client.get_policies_for_flight(&flight_id).len(), 2);
+
+    let pool_after_premiums = client.get_liquidity_pool();
+    
+    // Voo cancelado, ambos devem ser reembolsados
+    client.with_source_account(&admin).resolve_flight(&flight_id, &FlightResolution::Cancelled);
+
+    // Verifica apólice 1
+    let p1 = client.get_policy(&policy1_id);
+    assert_eq!(p1.status, PolicyStatus::Cancelled);
+    assert_eq!(p1.payout_amount, premium);
+
+    // Verifica apólice 2
+    let p2 = client.get_policy(&policy2_id);
+    assert_eq!(p2.status, PolicyStatus::Cancelled);
+    assert_eq!(p2.payout_amount, premium);
+
+    // Verifica balanços
+    assert_eq!(usdc_token.balance(&customer1), premium);
+    assert_eq!(usdc_token.balance(&customer2), premium);
+
+    // Verifica pool final
+    assert_eq!(client.get_liquidity_pool(), pool_after_premiums - (2 * premium));
+
+    // Verifica limpeza das listas
+    assert_eq!(client.get_active_policies().len(), 0);
+    assert_eq!(client.get_policies_for_flight(&flight_id).len(), 0);
+}
+
 
 #[test]
 #[should_panic]
-fn test_resolve_policy_not_admin() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let customer = Address::generate(&env);
-    let impostor = Address::generate(&env);
-    let token_addr = create_token_contract(&env, &admin);
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
-    let contract = create_insurance_contract(&env);
-    contract.initialize(&admin, &token_addr, &10_000_0000000i128);
-    token_admin_client.mint(&customer, &1000);
-    env.mock_all_auths();
-    let policy_id = contract.create_policy(
-        &customer, &String::from_str(&env, "F01"), &(env.ledger().timestamp() + 100), &100, &500
-    );
-    env.mock_auths(&[soroban_sdk::testutils::MockAuth {
-        address: &impostor,
-        invoke: &soroban_sdk::testutils::MockAuthInvoke {
-            contract: &contract.address,
-            fn_name: "resolve_policy",
-            args: (policy_id, false).into_val(&env),
-            sub_invokes: &[],
-        },
-    }]);
-    contract.resolve_policy(&policy_id, &false);
-}
-
-#[test]
-fn test_deposit_and_withdraw_pool() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let token_addr = create_token_contract(&env, &admin);
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
-    let token_client = token::Client::new(&env, &token_addr);
-    let contract = create_insurance_contract(&env);
-    let initial_capital = 10_000_0000000i128;
-    contract.initialize(&admin, &token_addr, &initial_capital);
-    token_admin_client.mint(&contract.address, &initial_capital);
-    let additional_deposit = 5_000_0000000i128;
-    token_admin_client.mint(&admin, &additional_deposit);
-    contract.deposit_to_pool(&additional_deposit);
-    let expected_pool = initial_capital + additional_deposit;
-    assert_eq!(contract.get_liquidity_pool(), expected_pool);
-    let withdrawal = 2_000_0000000i128;
-    let admin_balance_before = token_client.balance(&admin);
-    contract.withdraw_from_pool(&withdrawal);
-    let final_pool = expected_pool - withdrawal;
-    assert_eq!(contract.get_liquidity_pool(), final_pool);
-    let admin_balance_after = token_client.balance(&admin);
-    assert_eq!(admin_balance_after, admin_balance_before + withdrawal);
-}
-
-#[test]
-fn test_multiple_policies() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let customer1 = Address::generate(&env);
-    let customer2 = Address::generate(&env);
-    let token_addr = create_token_contract(&env, &admin);
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
-    let contract = create_insurance_contract(&env);
-    let initial_capital = 10_000_0000000i128;
-    contract.initialize(&admin, &token_addr, &initial_capital);
-    let premium_amount1 = 841_0000i128;
-    let coverage_amount1 = 50_0000000i128;
-    token_admin_client.mint(&customer1, &premium_amount1);
-    let policy_id1 = contract.create_policy(
-        &customer1, 
-        &String::from_str(&env, "G32102"),
-        &(env.ledger().timestamp() + 86400),
-        &premium_amount1, 
-        &coverage_amount1
-    );
-    let premium_amount2 = 1200_0000i128;
-    let coverage_amount2 = 75_0000000i128;
-    token_admin_client.mint(&customer2, &premium_amount2);
-    let policy_id2 = contract.create_policy(
-        &customer2,
-        &String::from_str(&env, "LA4567"),
-        &(env.ledger().timestamp() + 172800),
-        &premium_amount2,
-        &coverage_amount2
-    );
-    assert_eq!(policy_id1, 1);
-    assert_eq!(policy_id2, 2);
-    assert_eq!(contract.get_total_policies(), 2);
-    let active = contract.get_active_policies();
-    assert_eq!(active.len(), 2);
-    let expected_pool = initial_capital + premium_amount1 + premium_amount2;
-    assert_eq!(contract.get_liquidity_pool(), expected_pool);
-}
-
-#[test]
-#[should_panic(expected = "Flight date must be in the future")]
-fn test_create_policy_past_date() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let customer = Address::generate(&env);
-    let token_addr = create_token_contract(&env, &admin);
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
-    let contract = create_insurance_contract(&env);
-
-    let initial_capital = 10_000_0000000i128;
-    contract.initialize(&admin, &token_addr, &initial_capital);
-
-    let premium_amount = 841_0000i128;
-    let coverage_amount = 50_0000000i128;
-    token_admin_client.mint(&customer, &premium_amount);
-
-    // --- CORREÇÃO APLICADA AQUI ---
-    // 1. Define um timestamp inicial para o ledger.
-    env.ledger().with_mut(|li| {
-        li.timestamp = 100_000;
-    });
-
-    let flight_id = String::from_str(&env, "G32102");
-    // 2. Agora a subtração funciona sem overflow.
-    let past_date = env.ledger().timestamp() - 3600; 
-
-    // 3. A chamada abaixo agora vai falhar com a mensagem correta do contrato.
-    contract.create_policy(&customer, &flight_id, &past_date, &premium_amount, &coverage_amount);
-}
-
-#[test]
-#[should_panic(expected = "Policy already resolved")]
-fn test_resolve_policy_twice() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let customer = Address::generate(&env);
-    let token_addr = create_token_contract(&env, &admin);
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
-    let contract = create_insurance_contract(&env);
-    let initial_capital = 10_000_0000000i128;
-    contract.initialize(&admin, &token_addr, &initial_capital);
-    let premium_amount = 841_0000i128;
-    let coverage_amount = 50_0000000i128;
-    token_admin_client.mint(&customer, &premium_amount);
-    token_admin_client.mint(&contract.address, &(initial_capital + premium_amount));
-    let flight_id = String::from_str(&env, "G32102");
-    let flight_date = env.ledger().timestamp() + (24 * 60 * 60);
-    let policy_id = contract.create_policy(
-        &customer, &flight_id, &flight_date, &premium_amount, &coverage_amount
-    );
-    env.ledger().with_mut(|li: &mut LedgerInfo| {
-        li.timestamp = flight_date + 3600;
-    });
-    contract.resolve_policy(&policy_id, &false);
-    contract.resolve_policy(&policy_id, &false);
-}
-
-#[test]
-#[should_panic(expected = "Resolution deadline expired")]
-fn test_resolve_policy_too_late() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let customer = Address::generate(&env);
-    let token_addr = create_token_contract(&env, &admin);
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
-    let contract = create_insurance_contract(&env);
-    let initial_capital = 10_000_0000000i128;
-    contract.initialize(&admin, &token_addr, &initial_capital);
-    let premium_amount = 841_0000i128;
-    let coverage_amount = 50_0000000i128;
-    token_admin_client.mint(&customer, &premium_amount);
-    let flight_id = String::from_str(&env, "G32102");
-    let flight_date = env.ledger().timestamp() + (24 * 60 * 60);
-    let policy_id = contract.create_policy(
-        &customer, &flight_id, &flight_date, &premium_amount, &coverage_amount
-    );
-    env.ledger().with_mut(|li| {
-        li.timestamp = flight_date + (25 * 60 * 60);
-    });
-    contract.resolve_policy(&policy_id, &false);
-}
-
-#[test]
-#[should_panic(expected = "Withdrawal would compromise active policies coverage")]
-fn test_withdraw_compromises_active_policies() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let admin = Address::generate(&env);
-    let customer = Address::generate(&env);
-    let token_addr = create_token_contract(&env, &admin);
-    let token_admin_client = token::StellarAssetClient::new(&env, &token_addr);
-    let contract = create_insurance_contract(&env);
-    let initial_capital = 2_000_0000000i128;
-    contract.initialize(&admin, &token_addr, &initial_capital);
-    let premium_amount = 50_0000000i128;
-    let coverage_amount = 1_500_0000000i128;
-    token_admin_client.mint(&customer, &premium_amount);
-    let flight_id = String::from_str(&env, "G32102");
-    let flight_date = env.ledger().timestamp() + (24 * 60 * 60);
-    contract.create_policy(&customer, &flight_id, &flight_date, &premium_amount, &coverage_amount);
-    let withdrawal = 1_000_0000000i128;
-    contract.withdraw_from_pool(&withdrawal);
+fn test_resolve_flight_not_admin() {
+    let (env, client, _, _, _) = setup_contract();
+    let not_admin = Address::random(&env);
+    // Tenta resolver sem ser admin
+    client.with_source_account(&not_admin).resolve_flight(&"FL123".into_val(&env), &FlightResolution::OnTime);
 }
